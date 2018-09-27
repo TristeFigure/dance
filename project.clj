@@ -1,4 +1,4 @@
-(defproject dance "0.1.1"
+(defproject dance "0.2.0-SNAPSHOT"
   :description "Advanced tree walking in Clojure"
   :url "https://github.com/TristeFigure/dance"
   :license {:name "Eclipse Public License"
@@ -6,8 +6,9 @@
   :dependencies [[org.clojure/clojure "1.9.0"]
                  [arity "0.2.0"]
                  [weaving "0.1.3"]
-                 [threading "0.3.0"]
-                 [org.clojars.tristefigure/shuriken "0.14.12"]]
+                 [threading "0.3.3"]
+                 [org.clojars.tristefigure/shuriken "0.14.20"]
+                 [org.flatland/ordered "1.5.6"]]
   :profiles {:dev {:dependencies [[codox-theme-rdash "0.1.2"]]}}
   :plugins [[lein-codox "0.10.3"]]
   :codox {:source-uri "https://github.com/TristeFigure/dance/" \

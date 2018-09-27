@@ -1,5 +1,4 @@
 (ns dance.core
-  (:use clojure.pprint)
   (:require [shuriken.associative :refer [deep-merge]]
             [shuriken.debug :refer [debug-print]]
             [shuriken.namespace :refer [import-namespace]]
@@ -13,31 +12,7 @@
 
 (def ^:private is-form? @#'dance.floor/is-form?)
 
-;; TODO: move everything to dance.music.
-
-(defn map-entry [x]
-  (if (map-entry? x)
-    x
-    (clojure.lang.MapEntry/create (first x) (second x))))
-
 (def ^:private dance-identity (context| identity))
-
-(defn- context-walk [step scoped unscoped inner outer form context]
-  (let [marche (fn [& {:as opts}]
-                 (step form (merge {:initial-acc []
-                                    :initial-context context
-                                    :wrap identity
-                                    :inner inner :outer outer
-                                    :scoped scoped
-                                    :unscoped unscoped}
-                                   opts)))]
-    (cond
-      (list? form)      (marche :wrap #(apply list %))
-      (map-entry? form) (marche :wrap map-entry)
-      (seq? form)       (doall (marche :wrap seq))
-      (record? form)    (marche :initial-acc form)
-      (coll? form)      (marche :wrap #(into (empty form) %))
-      :else             (outer form context))))
 
 (def ^:dynamic *default-dance*
   {})
@@ -128,35 +103,66 @@
                         vec)))
          (apply list))))
 
+(defn- should-debug? [ctx condition]
+  (and condition
+       (if-let [d (:debug-depth ctx)]
+         (if (neg? d)
+           true
+           (<= (:depth ctx) (:debug-depth ctx)))
+         true)))
+
+(defn- filter-ctx [ctx debug-context-whitelist debug-context-blacklist]
+  (if (seq debug-context-whitelist)
+    (select-keys ctx debug-context-whitelist)
+    (into {} (remove #(contains? debug-context-blacklist (key %))
+                     ctx))))
+
+(def ^:private tab "  ")
+
 (def ^:private dance*-debugs
   '{[should-walk ctx]
-    (when debug
-      (let [tabs (str (apply str (repeat depth "  "))
+    (when (should-debug? ctx debug)
+      (let [tabs (str (apply str (repeat depth tab))
                       "- ")]
         (cond
           (backtrack? ctx) (debug-print   (str tabs "Backtracked on ") form)
           should-walk      (debug-print   (str tabs "Walking        ") form)
           :else            (debug-print   (str tabs "Not walking    ") form)))
-      (when debug-context
-         (debug-print                 (str tabs "Context        ") ctx)))
+      (when (should-debug? ctx debug-context)
+        (debug-print                     (str tabs "Context        ")
+                     (filter-ctx ctx
+                                 debug-context-whitelist
+                                 debug-context-blacklist))))
 
     [pre-result ctx]
-    (when debug
+    (when (should-debug? ctx debug)
       (cond
-        (backtrack? ctx) (debug-print   (str tabs "Backtracked on ") form)
-        should-pre (when (not= pre-result form)
-                     (debug-print (str tabs "Pre            ") pre-result)))
-      (when (and debug-context (not= ctx prev-ctx))
-        (debug-print (str tabs "New context    ") ctx)))
+        (backtrack? ctx) (debug-print     (str tabs "Backtracked on ") form)
+        should-pre       (when (should-debug? ctx (not= pre-result form))
+                           (debug-print   (str tabs "Pre            ") pre-result)))
+      (when (should-debug? ctx (and debug-context (not= ctx prev-ctx)))
+        (debug-print                      (str tabs "New context    ")
+                                          (filter-ctx ctx
+                                                      debug-context-whitelist
+                                                      debug-context-blacklist)))
+      (when (•- ctx (-> :debug-depth (and-> (some-> (>= 0))
+                                            (= (-• :depth))
+                                            (<- (coll? pre-result)))))
+        (println
+          (str tabs tab
+               "... (not showing " (count pre-result) " children nodes)"))))
 
     [result ctx]
-    (when debug
+    (when (should-debug? ctx debug)
       (if should-post
-        (when (not= result posted out)
+        (when (should-debug? ctx (not= result posted out))
           (debug-print                (str tabs "Post           ") result))
         (debug-print                  (str tabs "No post        ") result))
-      (when (and debug-context (not= ctx prev-ctx))
-        (debug-print                  (str tabs "New context    ") ctx)))})
+      (if (should-debug? ctx (and debug-context (not= ctx prev-ctx)))
+        (debug-print                  (str tabs "New context    ")
+                                      (filter-ctx ctx
+                                                  debug-context-whitelist
+                                                  debug-context-blacklist))))})
 
 ;; Variable names in this function's "let" matter for the debugging from above.
 (defn- dance*
@@ -164,11 +170,12 @@
                 pre?    pre
                 post?   post
                 before  after
-                context return-context
+                context return
                 debug   debug-context
-                scoped  unscoped
-                step]
+                step
+                debug-context-whitelist debug-context-blacklist]
          :as opts}]
+  ;; TODO: ensure debugs are not added at compile-time if unnecessary.
   (add-debugs
     dance*-debugs
     (let [[form ctx]        (before form context)
@@ -183,8 +190,6 @@
           [out ctx]         (if should-walk
                               (context-walk
                                 step
-                                scoped
-                                unscoped
                                 (fn [form ctx]
                                   (dance* form (assoc opts :context ctx)))
                                 dance-identity
@@ -197,6 +202,10 @@
                                 [out ctx])
           [result ctx]        (after posted ctx)]
       [result ctx])))
+
+(defn- identities [& args]
+  (when-> args (-> count (= 1))
+    first))
 
 ;; TODO: support deepmerge (the way contexts are merged)
 (defn dance
@@ -212,7 +221,7 @@
     :post?          number?
     :post           (fn [x ctx] [(inc x) (update ctx :cnt inc)])
     :context        {:cnt 0}
-    :return-context true
+    :return         :form-and-context
     :debug          true
     )
   ```
@@ -227,8 +236,8 @@
   `pre?` and `post?` respectively condition `pre` and `post` while the
   walk of the substructure itself occurs in between and is conditioned
   by `walk?`. `before`and `after` are respectively called before and
-  after any node is processed while `before-all` and `after-all` are
-  called once, at the beginning and the end of the walk.
+  after any node is processed (before `pre`) while `before-all` and
+  `after-all` are called once, at the beginning and the end of the walk.
 
   Traversal appears to occur in pre-order for `before`, `walk?` `pre?`
   and `pre`, but in post-order for `post?`, `post` and `after`.
@@ -245,7 +254,8 @@
   (`pre?`, `post?`, ...).
 
   This context is passed walking down the structure from node to
-  subnodes then back up to the initial root in a depth-first manner.
+  subnodes then back to the parent nodes up to the initial root in a
+  depth-first manner.
 
   By default, it is global to the walk and is not scoped by the depth
   at which it being accessed. In other words, the context is passed
@@ -254,12 +264,10 @@
   nodes, their children and eventually their ancestors.
 
   However the `:scoped` option can be used to specify which keys in
-  the context should be scoped by the walk and not thread through the
-  whole traversal. More specifically parents pass the context to their
-  children and changes made by the children are not visibile by their
-  ancestors or siblings.
-  The `:scope` and `:unscoped` options can be set on dances and on the
-  context.
+  the context should be scoped to the current node and its children
+  and not thread through the whole traversal. More specifically parents
+  pass the context to their children and changes made by the children are
+  not visibile by their ancestors or siblings.
 
   Note that variadic arguments functions count as single-argument to
   accomodate for functions like `constantly`, and thus cannot receive
@@ -281,17 +289,15 @@
   this plan:
 
   ```
-  - before, pre    : composed from left to right
-  - after, post    : composed from right to left
-  - pre?, walk?    : composed like `and`, from left to right
-  - post?          : composed like `and`, but from right to left.
-  - context        : composed with `merge`
-  - scoped         : composed with `concat`
-  - unscoped       : composed with `concat`
-  - return-context : right-most override
+  - before, pre : composed from left to right
+  - after, post : composed from right to left
+  - pre?, walk? : composed like `and`, from left to right
+  - post?       : composed like `and`, but from right to left.
+  - context     : composed with `merge`
+  - scoped      : composed with `#(clojure.set/union (set %1) (set %2))`
   ```
 
-  `:debug`, `:return-context`, and `:step` are merged normally, i.e.
+  `:debug`, `:return `, and `:step` are merged normally, i.e.
   via right-most preference.
 
   #### Early return
@@ -312,16 +318,18 @@
 
   #### Additional options
 
-  - `context`       : The initial context (defaults to `{}`)
-  - `return-context`: to return a vector like `[result context]`
-                      (`false`).
-  - `debug`         : To print a detailed trace of the walk (`false`).
-  - `depth`         : The intial depth. Determines tabulation (`0`)
-                      when debugging.
-  - `step`          : low-level option. See [[step]] and
-                      [[step-indexed]]. Defaults to [[step]]
+  - `context`                : The initial context (defaults to `{}`)
+  - `return`                 : `:form`, `:form-and-context` or `:context` (:form).
+  - `step`                   : low-level option. See [[step]] and
+                               [[step-indexed]]. Defaults to [[step]]
+  - `depth`                  : The intial depth. Determines tabulation (`0`)
+                               when debugging.
+  - `debug`                  : To print a detailed trace of the walk (`false`).
+  - `debug-depth`            : To limit the debug trace to a certain depth.
+  - `debug-context-blacklist`: To mask certain context keys when debugging.
+  - `debug-context-whitelist`: To display only certain context keys.
 
-  Any option passed to `dance` is optional including the dance fns."
+  Any option passed to `dance` is optional, including the dance fns."
   [form & args]
   (let [dances (take-while map? args)
         args-dance (->> args
@@ -330,11 +338,14 @@
                         (map vec)
                         (into {}))
         dances (concat dances [args-dance])
-        opts-dance (apply merge-dances *default-dance* dances)
+        opts-dance (apply merge-dances empty-dance *default-dance* dances)
         debug-context (if (contains? opts-dance :debug-context)
                         (:debug-context args-dance)
-                        (or (:return-context args-dance)
+                        (or (#{:context :form-and-context}
+                               (:return args-dance))
                             (contains? args-dance :context)
+                            (contains? args-dance :debug-context-whitelist)
+                            (contains? args-dance :debug-context-blacklist)
                             (->> (select-keys args-dance
                                               [:walk? :pre? :pre :post? :post
                                                :before :after
@@ -351,56 +362,23 @@
         [form ctx] (before-all form (:context opts-dance))
         [danced ctx] (try (dance* form (-> opts-dance
                                            (dissoc :before-all :after-all)
-                                           (assoc :context ctx)))
+                                           (assoc :context ctx)
+                                           (•- (assoc-in [:context :scoped]
+                                                         (-• :scoped)))
+                                           (let-> [d :debug-depth]
+                                             (when-> (<- d)
+                                               (assoc-in [:context :debug-depth]
+                                                         d)))))
                        (catch clojure.lang.ExceptionInfo e
                          (let [d (ex-data e)]
                            (if (-> d :type (= ::break-dance))
                              ((juxt :form :ctx) d)
                              (throw e)))))
-        [result ctx] (after-all danced ctx)]
-    (if (:return-context opts-dance)
-      [result ctx]
-      result)))
-
-
-
-
-
-
-
-
-
-
-
-
-(def form
-  '(let [a (• 1)
-         [b c] (• [2 3])
-         [d e & {:keys [f]}] (• [(+ a b) (+ a c) :f (+ b c)])]
-    #_(loop [g (• 1)
-           h (• 2)]
-      (fn [i] (• (inc i)))
-      (fn ([j] (• (inc j))))
-      #_(fn
-          ([k] (inc k))
-          ([l m] (+ l m)))
-      #_(letfn [(n [o] (inc o))
-                (p ([q] (inc q)))
-                (r ([s] (inc s))
-                   ([t u] (+ t u)))]))))
-
-#_(pprint
-  (dance form
-         locals-tracking-dance
-         :pre (fn [form ctx]
-                [form
-                 (if (and (seq? form) (-> form first (= '•)))
-                   (update ctx :results concat
-                           [[(second form)
-                             (->> ctx :locals
-                                  (filter #(-> % name count (= 1))))]])
-                   ctx)])
-         :after-all (fn [form ctx]
-                      (pprint (:results ctx)))
-         :debug true
-         ))
+        [result ctx] (after-all danced ctx)
+        [mode returner] (let [r (-> opts-dance :return)]
+                          (if (keyword? r) [r identities] r))]
+    ;; TODO: document :return properly
+    (case mode
+      :form             (returner result)
+      :context          (returner ctx)
+      :form-and-context (returner result ctx))))

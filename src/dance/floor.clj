@@ -1,4 +1,5 @@
 (ns dance.floor
+  (:use clojure.pprint)
   (:require [clojure.set :as set]
             [arity.core :refer [arities fake-arities]]
             [shuriken.associative :refer [merge-with-plan map-intersection]]
@@ -6,7 +7,9 @@
             [weaving.core :refer :all]
             [flatland.ordered.map :refer [ordered-map]]))
 
-;; TODO: backport to shuriken
+;; TODO: backport this multi-sym version to shuriken.
+;; We need to copy it over here because it's in shuriken.macro which already
+;; depends on dance.core.
 (defn is-form? [sym-or-syms expr]
   (let [syms (-> sym-or-syms
                  (when-not-> coll? list)
@@ -72,17 +75,80 @@
                 [k f])))
        (into {})))
 
+(defn dance-name [dance]
+  (-> dance meta :dance.core/dance-name))
+(defmacro with-dance-name [dance dance-name]
+  `(vary-meta ~dance assoc :dance.core/dance-name ~dance-name))
+
+;; TODO: keep subdance ?
+(defn subdances [dance]
+  (-> dance meta :dance.core/subdances))
+(defmacro with-subdances [dance subdances]
+  `(vary-meta ~dance assoc :dance.core/subdances ~subdances))
+
+(defn atomic-dance? [dance]
+  (-> dance subdances empty?))
+
+(defn all-subdances [dance]
+  (if (atomic-dance? dance)
+    [dance]
+    (mapcat all-subdances (subdances dance))))
+
+(defn defdance*
+  [nme dances]
+  `(def ~nme
+     ))
+
+(defmacro defdance [nme & body]
+  (let []
+    (shuriken.core/debug
+      `(do ~@(when (seq impl-dance)
+               [`(defdance ~impl-name ~impl-dance)])
+           (let [[dependent-dances# dances#]
+                 ~(if (seq impl-dance)
+                    `(let [ds# ~dependent-dances]
+                       [ds# (concat ds#  [~impl-name])])
+                    `(let [ds# ~dependent-dances]
+                       [ds# ds#]))]
+             (def ~nme
+               (-> (apply merge-dances dances#)
+                   (with-dance-name '~nme)
+                   (with-subdances dependent-dances#))))))))
+
+(defn ^:no-doc emit-defdance [nme dependent-dances impl-dance]
+  (let [dependent-dances (vec dependent-dances)]))
+
+(defmacro defdance [nme & body]
+  (let [[dependent-dances impl-dance] (split-with (not| keyword?) body)
+
+        impl-dance (-> (->> (partition 2 impl-dance)
+                            (map vec)
+                            seq
+                            (into {}))
+                       (with-dance-name impl-name))]
+    (if-not (empty? impl-dance)
+      (let [impl-name (-> nme name (str "*") symbol)]
+        `(do ~(emit-defdance impl-name [] impl-dance)
+             ~(emit-defdance nme (concat dependent-dances [impl-dance])))))))
+
 (defn merge-dances
   "Merges multiples dances together. A dance is a hash of arguments
   to [[dance]]."
   [& dances]
-  (apply merge-with-plan dance-merge-plan
-         (map adapt-dance-fns dances)))
+  (let [dances (map adapt-dance-fns dances)]
+    (-> (apply merge-with-plan dance-merge-plan dances)
+        (with-subdances dances))))
+
+; (defn order-dance [dance constraints]
+;   (let [dances (all-subdances dance)]
+;     (-> (->> (order dances constraints)
+;              (apply merge-with-plan dance-merge-plan))
+;         (with-subdances))))
 
 ;; TODO: remove form & subform arguments (here for debugging)
 ;; TODO: make a :scoped dance ? And set its :after rule to be :> :all via
 ;; shuriken.sequence/order ?
-(defn- handle-scoped [form subform prev-ctx new-ctx]
+(defn- handle-scoped [prev-ctx new-ctx]
   (let [prev-scoped    (-> prev-ctx :scoped set)
         new-scoped     (-> new-ctx  :scoped set)
         newly-scoped   (set/difference new-scoped prev-scoped)
@@ -103,17 +169,11 @@
   (let [[result context]
         (reduce (fn [[acc prev-ctx] subform]
                   (let [[result new-ctx] (inner subform prev-ctx)
-                        new-ctx (handle-scoped
-                                  form
-                                  subform
-                                  prev-ctx new-ctx)]
+                        new-ctx (handle-scoped prev-ctx new-ctx)]
                     [(conj acc result) new-ctx]))
                 [initial-acc initial-context]
                 form)]
-    (outer (wrap result) context)
-    #_(let [[new-form new-ctx] (outer (wrap result) context)]
-      [new-form
-       (handle-scoped nil form context new-ctx)])))
+    (outer (wrap result) context)))
 
 (defn step-indexed [form {:keys [initial-acc initial-context wrap inner outer]}]
   (let [indexes (if (record? form)
@@ -123,19 +183,13 @@
         (reduce (fn [[acc prev-ctx] [i subform]]
                   (let [ctx (assoc prev-ctx :index i)
                         [result new-ctx] (inner subform ctx)
-                        new-ctx (-> (handle-scoped
-                                      form
-                                      subform
-                                      prev-ctx new-ctx)
+                        new-ctx (-> (handle-scoped prev-ctx new-ctx)
                                     (assoc :index i))]
                     [(conj acc result) new-ctx]))
                 [initial-acc initial-context]
                 (into (ordered-map)
                       (map #(vector %1 %2) indexes form)))]
-    (outer (wrap result) context)
-    #_(let [[new-form new-ctx] (outer (wrap result) context)]
-      [new-form
-       (handle-scoped nil form context new-ctx)])))
+    (outer (wrap result) context)))
 
 (defn map-entry [x]
   (if (map-entry? x)
@@ -155,10 +209,7 @@
       (seq? form)       (doall (marche :wrap seq))
       (record? form)    (marche :initial-acc form)
       (coll? form)      (marche :wrap #(into (empty form) %))
-      :else             (outer form context)
-                        #_(let [[new-form new-ctx] (outer form context)]
-                          [new-form
-                           (handle-scoped nil form context new-ctx)]))))
+      :else             (outer form context))))
 
 (def empty-dance
   (adapt-dance-fns

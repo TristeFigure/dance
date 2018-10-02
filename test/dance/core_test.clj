@@ -1,7 +1,10 @@
 (ns dance.core-test
+  (:use clojure.pprint)
   (:require [clojure.test :refer :all]
             [dance.core :refer :all]
-            [threading.core :refer :all]))
+            [threading.core :refer :all]
+
+            [shuriken.core :refer [macroexpand-do]]))
 
 (defrecord DanceTestRecord [a b c])
 
@@ -9,6 +12,24 @@
   `(-> (with-out-str ~@body)
        (clojure.string/split  #"\n")
        (->> (mapv #(clojure.string/replace % #"\s+$" "")))))
+
+(defdance a-dance {:pre inc})
+(defdance b-dance :pre inc)
+(defdance c-dance :pre inc)
+
+(defdance abc-dance
+  a-dance b-dance c-dance
+  :pre (fn [x] (println x) x))
+
+
+;; TODO: namespace dance names
+(deftest test-dance-name
+  (is (= 'a-dance (dance-name a-dance)))
+  (is (= 'a-dance (let [d a-dance] (dance-name d)))))
+
+(deftest test-subdances
+  (is (= [a-dance b-dance c-dance] (subdances abc-dance)))
+  (is (= [{:pre inc}] (subdances a-dance))))
 
 (deftest test-simple-dance
   (is (= {:a 2 :b 3 :c 4}
@@ -328,3 +349,5 @@
             [2 1] 4
             [3] 5}
            (dance form leafs-collecting-dance)))))
+
+(run-tests)

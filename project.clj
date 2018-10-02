@@ -7,7 +7,7 @@
                  [arity "0.2.0"]
                  [weaving "0.1.3"]
                  [threading "0.3.3"]
-                 [org.clojars.tristefigure/shuriken "0.14.20"]
+                 [org.clojars.tristefigure/shuriken "0.14.22"]
                  [org.flatland/ordered "1.5.6"]]
   :profiles {:dev {:dependencies [[codox-theme-rdash "0.1.2"]]}}
   :plugins [[lein-codox "0.10.3"]]

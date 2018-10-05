@@ -1,5 +1,4 @@
 (ns dance.core-test
-  (:use clojure.pprint)
   (:require [clojure.test :refer :all]
             [dance.core :refer :all]
             [threading.core :refer :all]
@@ -14,27 +13,59 @@
        (->> (mapv #(clojure.string/replace % #"\s+$" "")))))
 
 (defdance a-dance {:pre inc})
-(defdance b-dance :pre inc)
-(defdance c-dance :pre inc)
+(defdance b-dance :pre dec)
+(defdance c-dance :pre -)
 
 (defdance abc-dance
   a-dance b-dance c-dance
   :pre (fn [x] (println x) x))
 
 
-;; TODO: namespace dance names
+; ;; TODO: namespace dance names
 (deftest test-dance-name
-  (is (= 'a-dance (dance-name a-dance)))
-  (is (= 'a-dance (let [d a-dance] (dance-name d)))))
+  (is (= 'a-dance    (dance-name a-dance)))
+  (is (= [nil]       (map dance-name (subdances a-dance))))
+  (is (= 'b-dance    (dance-name b-dance)))
+  (is (= ['b-dance*] (map dance-name (subdances b-dance))))
+  (is (= [nil]       (map dance-name (subdances b-dance*))))
+  (is (= 'abc-dance  (dance-name abc-dance)))
+  (is (= '[a-dance b-dance c-dance abc-dance*]
+         (map dance-name (subdances abc-dance)))))
+
+(deftest test-dependent-dances
+  (is (= [{:pre inc}]              (dependent-dances a-dance)))
+  (is (= nil                       (dependent-dances b-dance)))
+  (is (= [a-dance b-dance c-dance] (dependent-dances abc-dance))))
+
+(deftest test-impl-dance
+  (is (= nil        (dance-impl a-dance)))
+  (is (= b-dance*   (dance-impl b-dance)))
+  (is (= abc-dance* (dance-impl abc-dance))))
 
 (deftest test-subdances
-  (is (= [a-dance b-dance c-dance] (subdances abc-dance)))
-  (is (= [{:pre inc}] (subdances a-dance))))
+  (is (= [{:pre inc}]                         (subdances a-dance)))
+  (is (= [b-dance*]                           (subdances b-dance)))
+  (is (= [a-dance b-dance c-dance abc-dance*] (subdances abc-dance))))
+
+(deftest test-atomic-dance?
+  (is (false? (atomic-dance? a-dance)))
+  (is (true?  (atomic-dance? (-> a-dance subdances first))))
+  (is (false? (atomic-dance? b-dance)))
+  (is (true?  (atomic-dance? b-dance*)))
+  (is (false? (atomic-dance? abc-dance)))
+  (is (true?  (atomic-dance? abc-dance*))))
+
+(deftest test-atomic-dances
+  (is (= [{:pre inc}] (atomic-dances a-dance)))
+  (is (= [] (atomic-dances (-> a-dance subdances first))))
+  (is (= [b-dance*]   (atomic-dances b-dance)))
+  (is (= [{:pre inc} b-dance* c-dance* abc-dance*]
+         (atomic-dances abc-dance))))
 
 (deftest test-simple-dance
   (is (= {:a 2 :b 3 :c 4}
          (dance {:a 1 :b 2 :c 3}
-                :pre? number?
+                :pre?  number?
                 :post? number?
                 :post  inc))))
 
@@ -298,7 +329,10 @@
                  (letfn [(t [u] (• (inc u)))
                          (v ([w] (• (inc w)))
                             ([x y] (• (+ x y))))]
-                   (• (t (v 1 2))))))
+                   (• (t (v 1 2))))
+                 ;; shadowing
+                 #_(let [let (fn [x] (inc x))
+                         x (• )])))
         results (dance
                   form locals-tracking-dance
                   :pre
@@ -349,5 +383,3 @@
             [2 1] 4
             [3] 5}
            (dance form leafs-collecting-dance)))))
-
-(run-tests)

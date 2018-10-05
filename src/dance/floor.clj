@@ -1,5 +1,4 @@
 (ns dance.floor
-  (:use clojure.pprint)
   (:require [clojure.set :as set]
             [arity.core :refer [arities fake-arities]]
             [shuriken.associative :refer [merge-with-plan map-intersection]]
@@ -76,74 +75,129 @@
        (into {})))
 
 (defn dance-name [dance]
-  (-> dance meta :dance.core/dance-name))
-(defmacro with-dance-name [dance dance-name]
-  `(vary-meta ~dance assoc :dance.core/dance-name ~dance-name))
+  (-> dance meta :dance.core/name))
+(defmacro with-dance-name [dance-name dance]
+  (if dance-name
+    `(vary-meta ~dance assoc :dance.core/name ~dance-name)
+    dance))
 
-;; TODO: keep subdance ?
+(defn dance-impl [dance]
+  (-> dance meta :dance.core/impl))
+(defmacro with-dance-impl [impl dance]
+  `(let [impl# ~impl
+         d# ~dance]
+     (if (seq impl#)
+       (vary-meta d# assoc :dance.core/impl impl#)
+       d#)))
+
+(defn dependent-dances [dance]
+  (-> dance meta :dance.core/dependent-dances))
+(defmacro with-dependent-dances [dependent-dances dance]
+  `(let [ds# ~dependent-dances
+         d# ~dance]
+     (if (seq ds#)
+       (vary-meta d# assoc :dance.core/dependent-dances ds#)
+       d#)))
+
 (defn subdances [dance]
-  (-> dance meta :dance.core/subdances))
-(defmacro with-subdances [dance subdances]
-  `(vary-meta ~dance assoc :dance.core/subdances ~subdances))
+  (vec (concat (dependent-dances dance)
+               (when-let [impl (dance-impl dance)]
+                 [impl]))))
 
 (defn atomic-dance? [dance]
-  (-> dance subdances empty?))
+  (-> dance
+      (if-> dance-name
+        (and-> (-> dependent-dances empty?)
+               (not-> dance-impl dance-name))
+        (and-> (not-> dance-impl)
+               (not-> dependent-dances)))
+      boolean))
 
-(defn all-subdances [dance]
-  (if (atomic-dance? dance)
-    [dance]
-    (mapcat all-subdances (subdances dance))))
+(defn atomic-dances [dance]
+  (->> (tree-seq (not| atomic-dance?) subdances dance)
+       rest
+       (filter atomic-dance?)))
 
-(defn defdance*
-  [nme dances]
-  `(def ~nme
-     ))
+(defn ^:no-doc emit-defdance* [nme docstring dependent-dances impl]
+  `(def ~nme ~@(when docstring [docstring])
+     (let [ds# ~dependent-dances
+           impl# ~impl]
+       (->> (apply merge-dances (concat ds# (when (seq impl#) [impl#])))
+            (with-dance-name '~nme)
+            (with-dance-impl impl#)
+            (with-dependent-dances ds#)))))
 
-(defmacro defdance [nme & body]
-  (let []
-    (shuriken.core/debug
-      `(do ~@(when (seq impl-dance)
-               [`(defdance ~impl-name ~impl-dance)])
-           (let [[dependent-dances# dances#]
-                 ~(if (seq impl-dance)
-                    `(let [ds# ~dependent-dances]
-                       [ds# (concat ds#  [~impl-name])])
-                    `(let [ds# ~dependent-dances]
-                       [ds# ds#]))]
-             (def ~nme
-               (-> (apply merge-dances dances#)
-                   (with-dance-name '~nme)
-                   (with-subdances dependent-dances#))))))))
+(defmacro defdance [nme & args]
+  (let [[docstring body] (-> args (if-> (-> first string?)
+                                    (juxt-> first rest)
+                                    (juxt-> (<- nil) identity)))
+        [dependent-dances impl-dance] (split-with (not| keyword?) body)
+        dependent-dances (vec dependent-dances)
+        impl-name (-> nme name (str "*") symbol)
+        impl-dance? (->> (partition 2 impl-dance)
+                         (map vec)
+                         seq)
+        impl-dance (into {} impl-dance?)]
+    `(do ~@(when impl-dance?
+             [(emit-defdance* impl-name (format "See [[%s]]." nme)
+                              []
+                              impl-dance)])
+         ~(emit-defdance* nme docstring
+                          dependent-dances
+                          (if impl-dance? impl-name nil)))))
 
-(defn ^:no-doc emit-defdance [nme dependent-dances impl-dance]
-  (let [dependent-dances (vec dependent-dances)]))
+(defn ^:no-doc dance-collect* [when what at into accumulate position form ctx]
+  [form (when-> ctx (<- ((context| when) form ctx))
+          (update
+            at (fnil (fn [x]
+                       (accumulate
+                         x (first ((context| what)
+                                   form ctx))))
+                     into)))])
 
-(defmacro defdance [nme & body]
-  (let [[dependent-dances impl-dance] (split-with (not| keyword?) body)
+;; TODO: use something better than (context| when).
+(defmacro def-collecting-dance [nme & args]
+  (let [[docstring body] (-> args (if-> (-> first string?)
+                                    (juxt-> first rest)
+                                    (juxt-> (<- nil) identity)))
+        [dependent-dances impl-dance] (split-with (not| keyword?) body)
 
-        impl-dance (-> (->> (partition 2 impl-dance)
-                            (map vec)
-                            seq
-                            (into {}))
-                       (with-dance-name impl-name))]
-    (if-not (empty? impl-dance)
-      (let [impl-name (-> nme name (str "*") symbol)]
-        `(do ~(emit-defdance impl-name [] impl-dance)
-             ~(emit-defdance nme (concat dependent-dances [impl-dance])))))))
+        [& {:keys [when what at into accumulate position]
+            :or {into []
+                 accumulate conj
+                 position :post}
+            :as more-opts}]
+        impl-dance
 
+        position-sym (gensym "position-")
+        at-sym (gensym "at-")
+        collecting-dance
+        (-> more-opts
+            (dissoc :when :what :at :into :accumulate :position)
+            (merge {(keyword position)
+                    `(fn [form# ctx#]
+                       (dance-collect*
+                         ~when ~what ~at ~into ~accumulate ~position
+                         form# ctx#))
+                    :return [:context at]}))]
+    `(defdance ~nme ~@(or (and docstring [docstring]) [])
+       ~@dependent-dances
+       ~@(apply concat collecting-dance))))
+
+;; TODO: should have with-dependent-dances here but tests fail.
 (defn merge-dances
   "Merges multiples dances together. A dance is a hash of arguments
   to [[dance]]."
   [& dances]
   (let [dances (map adapt-dance-fns dances)]
-    (-> (apply merge-with-plan dance-merge-plan dances)
-        (with-subdances dances))))
+    (apply merge-with-plan dance-merge-plan dances)))
 
+;; TODO: find a way to order dances (i.e. to order a tree)
 ; (defn order-dance [dance constraints]
-;   (let [dances (all-subdances dance)]
+;   (let [dances (atomic-dances dance)]
 ;     (-> (->> (order dances constraints)
-;              (apply merge-with-plan dance-merge-plan))
-;         (with-subdances))))
+;              (apply merge-with-plan dance-merge-plan)
+;              (with-subdances dances)))))
 
 ;; TODO: remove form & subform arguments (here for debugging)
 ;; TODO: make a :scoped dance ? And set its :after rule to be :> :all via

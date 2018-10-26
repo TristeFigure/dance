@@ -1,4 +1,4 @@
-(defproject dance "0.2.0-SNAPSHOT"
+(defproject dance "0.1.2"
   :description "Advanced tree walking in Clojure"
   :url "https://github.com/TristeFigure/dance"
   :license {:name "Eclipse Public License"

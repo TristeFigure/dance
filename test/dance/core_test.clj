@@ -1,9 +1,7 @@
 (ns dance.core-test
   (:require [clojure.test :refer :all]
             [dance.core :refer :all]
-            [threading.core :refer :all]
-
-            [shuriken.core :refer [macroexpand-do]]))
+            [threading.core :refer :all]))
 
 (defrecord DanceTestRecord [a b c])
 

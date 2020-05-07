@@ -3,7 +3,7 @@
             [arity.core :refer [arities fake-arities]]
             [shuriken.associative :refer [merge-with-plan map-intersection]]
             [threading.core :refer :all]
-            [weaving.core :refer :all]
+            [weaving.core :refer :all :exclude [arity-comp]]
             [flatland.ordered.map :refer [ordered-map]]))
 
 ;; TODO: backport this multi-sym version to shuriken.
@@ -29,6 +29,16 @@
      (warp| ~f (fn
                  ([g# [form# ctx#]] (g# form# ctx#))
                  ([g# form# ctx#]   (g# form# ctx#))))))
+
+(defn- arity-comp
+  "Composes functions like `comp` but preserves arity."
+  ([]  identity)
+  ([f] f)
+  ([f & more-fns]
+   (let [fns (cons f more-fns)]
+     (fake-arities (-> fns last arities)
+                   #(apply (apply comp fns)
+                           %&)))))
 
 (contextualize ctx-comp arity-comp)
 (contextualize ctx->|   ->|)

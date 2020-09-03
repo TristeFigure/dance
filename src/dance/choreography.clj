@@ -1,46 +1,41 @@
 (ns dance.choreography
+  (:use clojure.pprint)
   (:require [clojure.set :as set]
             [shuriken.associative :refer [getsoc]]
             [shuriken.destructure :refer [deconstruct]]
-            [shuriken.sequential :refer [get-nth assoc-nth-in]]
+            [shuriken.sequential :refer [get-nth update-nth update-nth-in]]
             [shuriken.spec :refer [conform!]]
+            [clojure.spec.alpha :refer [conform]]
             [threading.core :refer :all]
             [weaving.core :refer :all]
             [dance.floor :refer :all]))
 
-(defdance parent-dance
-  "A dance that keeps track of the parent node.
-  Context keys: :parent (:next-parent)."
-  :scoped [:parent :next-parent]
-  :before (fn [form ctx]
-            [form (assoc ctx
-                    :parent (:next-parent ctx)
-                    :next-parent form)]))
-
-(defdance parents-dance
-  "A dance that keeps track of the parent nodes, in genealogic order
-  (parent, grand-parent, ...).
-  Context keys: :parents (:next-parent)."
-  :scoped [:parents :next-parent]
-  :context {:parents '()}
+(defdance ancestors-dance
+  "A dance that keeps track of the parent nodes, in ascending genealogic
+  order (parent, grand-parent, ...).
+  Context keys: :ancestors (:next-parent)."
+  :scoped [:ancestors :next-parent]
+  :context {:ancestors '()}
   :before (fn [form ctx]
             [form (-> ctx
                       (when-> :next-parent
-                        (update :parents conj (:next-parent ctx)))
+                        (update :ancestors conj (:next-parent ctx)))
                       (assoc :next-parent form))]))
+
+;; TODO: use fun-map ?
+(defdance parent-dance
+  "A dance that keeps track of the parent node.
+  Context keys: :parent."
+  ancestors-dance
+  :scoped [:parent]
+  :before (fn [form ctx]
+            [form (assoc ctx :parent (-> ctx :ancestors first))]))
 
 ;; TODO: document
 (defdance original-form-dance
   :scoped [:original-form]
   :before (fn [form ctx]
             [form (assoc ctx :original-form form)]))
-
-(defdance depth-dance
-  "A dance that keeps track of the depth of the traversal.
-  Context key: :depth."
-  :context {:debug-depth -1}
-  :scoped [:depth]
-  :before (fn [x ctx] [x (update ctx :depth (fnil inc -1))]))
 
 ;; TODO: does it work with sets ?
 ;; TODO: use :scoped [:index] ?
@@ -49,7 +44,7 @@
   its parent node. The index can be either a number for list/vectors or
   anything else for maps.
   Context key: :index."
-  :step  step-indexed
+  :step (ø| step-indexed)
   :scoped [:index])
 
 (defdance path-dance
@@ -110,151 +105,371 @@
                 spliced
                 (reverse (into '() spliced)))))))
 
-(let [unquoted? #(not (is-form? 'quote %))]
-  (defdance not-processing-quoted-forms-dance
-    :pre?  unquoted?
-    :walk? unquoted?
-    :post? unquoted?))
-
-(defdance reluctant-macroexpanding-dance
-  not-processing-quoted-forms-dance
+(defdance macroexpanding-dance
   :before macroexpand)
 
-(defn get-right-context [ctx]
-  (-> ctx :right-contexts first))
+(def ^:no-doc quoted?
+  (|| is-form? 'quote))
 
-(defn add-to-right-context [ctx & kvs]
-  (assert (even? (count kvs)))
-  (reduce (fn [acc [k v]]
-            (assoc-nth-in acc [:right-contexts 0 k] v))
-          ctx (partition 2 kvs)))
+(defdance reluctant-macroexpanding-dance
+  :before (when| (not| quoted?) macroexpand))
 
-(defn update-right-context [ctx k f & args]
-  (-> (get-right-context ctx)
-      (get k)
-      (as-> $ (apply f $ args))
-      (->> (add-to-right-context ctx k))))
+;; TODO: move to shuriken.associative
+(defn merge-with-plan
+  "Like `merge-with` except that the combination fn of a specific pair
+  of entries is determined by looking up their key in `plan`. If not
+  found, falls back to the function found under key `:else` or if not
+  provided to a function that returns the value in the right-most map,
+  thus providing the behavior of `merge`.
+  In addition to a map, `plan` can also be a function accepting a key
+  and returning a combination fn for the two values to merge."
+  [plan & maps]
+    (when (some identity maps) ;; TODO: what the hell ?
+      (let [merge-entry (fn [m e]
+                          (let [k (key e) v (val e)]
+                            (if (contains? m k)
+                              (let [else-f (get plan :else  #(identity %2))
+                                    f (get plan k else-f)]
+                                (assoc m k (f (get m k) v)))
+                              (assoc m k v))))
+            merge2 (fn [m1 m2]
+                     (reduce merge-entry (or m1 {}) (seq m2)))]
+        (reduce merge2 maps))))
 
-(defdance right-context-dance
-  :before (fn [form ctx]
-            [form (-> ctx
-                      (update :right-contexts (fnil #(cons %2 %1) '()) {})
-                      (•- (merge (-• :context-from-left)))
-                      (dissoc :context-from-left))])
-  :after  (fn [form ctx]
-            [form (let [ctx (-> ctx
-                                (•- (merge (-• :context-from-left)))
-                                (dissoc :context-from-left))
-                        [s & ss] (:right-contexts ctx)
-                        ctx (if (empty? ss)
-                              (dissoc ctx :right-contexts)
-                              (assoc ctx :right-contexts ss))
-                        ctx (if (empty? s)
-                              ctx
-                              (assoc ctx :context-from-left s))]
-                    ctx)]))
+(defn last-in-coll? [ctx form]
+  (-> ctx :parent last (= form)))
 
 
-(def ^:private rdistinct (comp reverse distinct reverse))
+(defn get-precontext [ctx]
+  (-> ctx :precontexts first))
+
+(defn wrap-in-precontext [x]
+  {:precontext x})
+
+(defn- list-or-map-instead-of-nil [pth _coll]
+  (if (-> pth last integer?)
+    '()
+    {}))
+
+;; Generic
+(defn update-nth-next-context [ctx n f & args]
+  (apply update-nth-in
+         list-or-map-instead-of-nil
+         ctx [:precontexts 0]
+         (if (> n 0)
+           #(apply update-nth-next-context %1 (dec n) f %&)
+           f)
+         args))
+
+(defn update-in-nth-next-context [ctx n k-or-ks f & args]
+  (apply update-nth-in
+         list-or-map-instead-of-nil
+         ctx [:precontexts 0]
+         (if (> n 0)
+           #(apply update-in-nth-next-context %1 (dec n) k-or-ks f %&)
+           (let [ks (when-not-> k-or-ks sequential? vector)]
+             #(apply update-nth-in %1 ks f %&)))
+         args))
+
+(defn add-to-nth-next-context [ctx n m]
+  (update-nth-next-context ctx n merge m))
+
+;; Next context
+(defn update-next-context [ctx f & args]
+  (apply update-nth-next-context ctx 0 f args))
+
+(defn update-in-next-context [ctx k-or-ks f & args]
+  (apply update-in-nth-next-context ctx 0 k-or-ks f args))
+
+(defn add-to-next-context [ctx m]
+  (add-to-nth-next-context ctx 0 m))
+
+;; Second next context
+(defn update-second-next-context [ctx f & args]
+  (apply update-nth-next-context ctx 1 f args))
+
+(defn update-in-second-next-context [ctx k-or-ks f & args]
+  (apply update-in-nth-next-context ctx 1 k-or-ks f args))
+
+(defn add-to-second-next-context [ctx m]
+  (apply add-to-nth-next-context ctx 1 m))
+
+
+
+(defn update-right-context [form ctx f & args]
+  (when-not-> ctx (last-in-coll? form)
+    (apply-> (update-next-context f args))))
+
+(defn update-in-right-context [form ctx k-or-ks f & args]
+  (when-not-> ctx (last-in-coll? form)
+    (apply-> (update-in-next-context k-or-ks f args))))
+
+(defn add-to-right-context [form ctx m]
+  (when-not-> ctx (last-in-coll? form)
+    (add-to-next-context m)))
+
+(def ^:private rdistinct     (comp reverse distinct reverse))
+(def ^:private fusion-locals (comp vec rdistinct concat))
+
+;; TODO: move to shuriken.sequence
+(defn pad
+  "Returns [a b] such that both sequences have the same length."
+  ([a b] (pad nil a b))
+  ([padding a b]
+   (if (> (count a) (count b))
+     [a (concat b (repeat (- (count a) (count b)) padding))]
+     [(concat a (repeat (- (count b) (count a)) padding)) b])))
+
+(defn- fusion-precontexts [a b]
+  ;; TODO: that should depend on the context.
+  (apply map #(merge-with-plan {:locals fusion-locals}
+                               %1 %2)
+         (pad a b)))
+
+(defn- pop-precontext [ctx]
+  (update ctx :precontexts rest))
+
+(defn- push-precontext [ctx]
+  (update ctx :precontexts (|| cons {})))
+
+(defn- prepare-to-absorb-context [ctx]
+  (update ctx :precontext-to-absorb
+          #(merge-with-plan
+             (merge (:precontext-merge-plan (get-precontext ctx))
+                    (:precontext-merge-plan %))
+             %
+             (get-precontext ctx))))
+
+(defn- absorb-precontext [ctx]
+  (-> (merge-with-plan (:precontext-merge-plan ctx)
+                       ctx
+                       (:precontext-to-absorb ctx))
+      (dissoc :precontext-to-absorb)))
+
+(defdance precontext-dance
+  parent-dance
+  :dance-args [:precontext-merge-plan]
+  :merge-plan {:precontext-merge-plan merge}
+  :precontext-merge-plan {:precontexts fusion-precontexts}
+  ; :handle-scope (fn [original form subform prev-ctx new-ctx]
+  ;                  (original form subform
+  ;                            prev-ctx
+  ;                            new-ctx
+  ;                            #_(merge-with-plan (:precontext-merge-plan prev-ctx)
+  ;                                             prev-ctx
+  ;                                             (:precontext-to-absorb new-ctx))
+  ;                            #_(dissoc new-ctx :precontext-to-absorb)))
+  :step (fn [original form opts]
+          (-> opts
+              (update :initial-context (->| absorb-precontext
+                                            push-precontext))
+              (->> (original form))
+              (as-> [result ctx]
+                [result (-> ctx
+                            prepare-to-absorb-context
+                            pop-precontext)])))
+  ; :before (ctx| absorb-precontext
+  ;               push-precontext)
+  ; :after  (ctx| prepare-to-absorb-context
+  ;               pop-precontext)
+  )
 
 (defn- add-locals-to-current-context [ctx locals]
-  (update ctx :locals (comp rdistinct concat) locals))
+  (update ctx :locals fusion-locals locals))
 
-(defn- add-locals-to-right-context [ctx locals]
-  (update-right-context
-    ctx :locals-from-left (comp rdistinct concat)
-    locals))
+; (defn- add-locals-to-next-context [ctx locals]
+;   (update-in-next-context
+;     ctx :locals fusion-locals
+;     ;; TODO: remove filter
+;     (filter #(= (count (str %)) 1)
+;             locals)))
 
+(defn- add-locals-to-second-next-context [ctx locals]
+  (update-in-second-next-context ctx :locals fusion-locals locals))
+
+; (defn- add-locals-to-right-context [form ctx locals]
+;   (update-in-right-context
+;     form ctx :locals fusion-locals
+;     ;; TODO: remove filter
+;     (filter #(= (count (str %)) 1)
+;             locals)))
+
+(defn- make-locals-scoped [ctx]
+  (println "------> LOCALS SCOPED")
+  (update ctx :scoped #(set/union (set %) #{:locals})))
+
+(defn- make-locals-unscoped [ctx]
+  (println "------> LOCALS UNSCOPED")
+  (update ctx :scoped disj :locals))
+
+;; -- Top level
 (defdance ^:private locals-tracking-dance--top-level
   :context {:locals []}
-  :scoped [:locals :binding-form?]
-  :before
+  :scoped [:locals :binding-form?] ;; the main trick: :scoped is scoped
+  ;; TODO: use commented version (bugs idontknowwhy)
+  :before ;(ctx| (when| (|| is-form? '[let* loop* letfn* fn* reify*])
+          ;        make-locals-scoped))
   (fn [form ctx]
-    [form (when-> ctx (<- (is-form? '[let* loop* fn* letfn*] form))
-            (update :scoped #(set/union (set %) #{:locals})))]))
+    [form (when-> ctx (<- (is-form? '[let* loop* letfn* fn* reify*] form))
+            make-locals-scoped)]))
 
-(defdance ^:private locals-tracking-dance--handle-locals-from-left
-  :before
-  (fn [form ctx]
-    [form (when-> ctx :locals-from-left
-            (-> (update :locals (comp rdistinct concat)
-                        (:locals-from-left ctx))
-                (dissoc :locals-from-left)))]))
+;; TODO: move to shuriken.sequential
+(defn third  [x] (-> x next next first))
+(defn fourth [x] (-> x next next next first))
+(defn fifth  [x] (-> x next next next next first))
 
-
+;; -- let, loop & letfn: binding vector
 (defdance ^:private locals-tracking-dance--let*-loop*-letfn*-binding-vec
   :before
   (fn [form ctx]
-    [form (when-> ctx (-> :parents first
-                          (and-> (-> (or->> (is-form? '[let* loop* letfn*])))
-                                 (-> second (= form))))
-            (update :scoped disj :locals))]))
+    ;; When the form is a child form of a binding form
+    [form (when-> ctx (-> :parent (and-> (->> (is-form? '[let* loop* letfn*]))
+                                         (-> second  (= form))))
+            make-locals-unscoped)]))
 
-(defdance ^:private locals-tracking-dance--let*-loop*-letfn*-binding-sym-expr
+;; -- let, loop & letfn: binding syms & exprs
+(defdance ^:private locals-tracking-dance--let*-loop*-letfn*-binding-sym
   :before
   (fn [form ctx]
-    [form
-     (when-> ctx (and->
-                   (-> :parents second (or->> (is-form? '[let* loop* letfn*])))
-                   (>-args (-> (= (-> :parents second second)
-                                  (-> :parents first)))))
-       (if-> (-> :index even?)
-         ;; a bound sym, not an expr
-         (assoc :binding-form? true)
-         ;; a bound expr, not a sym
-         (let-> [i :index
-                 parent (-> :parents first)
-                 prev-form (<- (get parent (dec i)))]
-           (add-locals-to-right-context (deconstruct prev-form)))))]))
+    [form (when-> ctx (and->
+                        ;; When we're processing elements of a binding vector
+                        (->> :ancestors second (is-form? '[let* loop* letfn*]))
+                        (>-args (-> (= (-> :ancestors second second)
+                                       (-> :ancestors first)))))
+            ;; when these are binding syms, not exprs
+            (if-> (-> :index even?)
+              (-> (assoc :binding-form? true)
+                  (add-locals-to-second-next-context (deconstruct form)))
+              ;; when these are binding exprs of a letfn form
+              (when-> (->> :ancestors second (is-form? 'letfn))
+                )))]))
+
+;; -- fn
+; (defdance ^:private locals-tracking-dance--fn*-single-body
+;   :before
+;   (fn [form ctx]
+;     [form (if (is-form? 'fn* form)
+;             (let [parsed (conform! :shuriken.spec/fn-form form)]
+;               (if (-> parsed :bodies count (= 1))
+;                 (add-locals-to-current-context
+;                   ctx (concat (keep identity [(:name parsed)])
+;                               (->> parsed :bodies first :args deconstruct)))
+;                 ctx))
+;             ctx)]))
+
+(require '[clojure.tools.macro :refer [symbol-macrolet]])
+(defmacro lay [[sym expr & more-bindings] & body]
+  (let [delay-sym (gensym (str "laid-" sym "-"))]
+    `(let [~delay-sym (delay ~expr)]
+       (symbol-macrolet [~sym (deref ~delay-sym)]
+         ~@(if (empty? more-bindings)
+             body
+             `[(lay ~more-bindings ~@body)])))))
+
+; (lay [a      (println "aaa")
+;       parent (println "parent")
+;       b      (do parent (println "bbb"))]
+;   b
+;   a)
+
+;; TODO: move to shuriken.sequential
+(defn compact [s]
+  (remove nil? s))
+
+(defdance ^:private locals-tracking-dance--fn*-single-body
+  :before
+  (fn [form ctx]
+    (lay [parent        (->> ctx :ancestors first)
+          form-is-fn    (is-form? 'fn* form)
+          parsed-fn     (conform! :shuriken.spec/fn-form form)
+          parsed-body   (-> (conform :shuriken.spec/args+body form)
+                            (when-> #{:clojure.spec.alpha/invalid}
+                              (<- nil)))
+          first-body    (when form-is-fn (-> parsed-fn :bodies first))
+          single-body   (:single-body first-body)
+          body-of-multi (and (is-form? 'fn* parent)
+                             (seq? form)
+                             (not single-body))
+          parsed        (cond form-is-fn     parsed-fn
+                              body-of-multi  parsed-body)
+          single-args   (when single-body (:args first-body))
+          multi-args    (:args parsed)
+          args          (or single-args multi-args)
+          single-name   (:name parsed)
+          multi-name    (when parsed
+                          (some->> parent (conform! :shuriken.spec/fn-form)
+                                   :name))
+          name          (if single-args single-name multi-name)
+          locals        (concat (compact [name])
+                                (deconstruct args))]
+      #_(when true
+        (println "==> FORM       " form)
+        (println "==> PARSED     " parsed)
+        (println "=>> SINGLE ARGS" single-args)
+        (println "=>> MULTI ARGS " multi-args)
+        (println "==> ARGS       " args)
+        (println "==> SINGLE NAME" single-name)
+        (println "==> MULTI NAME " multi-name)
+        (println "==> NAME       " name)
+        (println "==> LOCALS     " locals))
+      [form (when-> ctx (<- args)
+              (add-locals-to-current-context locals))])))
+
+; (defdance ^:private locals-tracking-dance--fn*-multiple-bodies
+;   :scoped [:parsed-fn-form]
+;   :before
+;   (fn [form ctx]
+;     [form (let [parent (->> ctx :ancestors first)]
+;             (if (and (is-form? 'fn* parent) (seq? form))
+;               (let [parsed (conform! :shuriken.spec/fn-form parent)]
+;                 (if (-> parsed :bodies count (> 1))
+;                   (add-locals-to-current-context
+;                     ctx
+;                     (concat (keep identity [(:name parsed)])
+;                             (-> (conform! :shuriken.spec/args+body form)
+;                                 :args deconstruct)))
+;                   ctx))
+;               ctx))]))
+
+;;; -- reify
+; (defdance ^:private locals-tracking-dance--reify*
+;   :before
+;   (fn [form ctx]
+;     [form
+;      (if-> ctx (and-> (<- (seq? form))
+;                       (->> :ancestors first (is-form? 'reify*)))
+;        make-locals-scoped
+;        (when-> (and-> (<- (vector? form))
+;                       (->> :ancestors second (is-form? 'reify*)))
+;          (-> make-locals-unscoped
+;              (as-> $ (add-locals-to-next-context
+;                        form $ (deconstruct form))))))]))
 
 (defdance ^:private locals-tracking-dance--let*-loop*-letfn*
   locals-tracking-dance--let*-loop*-letfn*-binding-vec
-  locals-tracking-dance--let*-loop*-letfn*-binding-sym-expr)
-
-
-(defdance ^:private locals-tracking-dance--fn*-single-body
-  :scoped [:parsed-fn-form]
-  :before
-  (fn [form ctx]
-    [form
-     (when-> ctx (<- (is-form? 'fn* form))
-       (<- (let [[parsed ctx] (getsoc ctx :parsed-fn-form
-                                      #(conform! :shuriken.spec/fn-form form))]
-             (when-> ctx (<- (-> parsed :bodies count (= 1)))
-               (add-locals-to-current-context
-                 (concat (keep identity [(:name parsed)])
-                         (->> parsed :bodies first :args deconstruct)))))))]))
-
-(defdance ^:private locals-tracking-dance--fn*-multiple-bodies
-  :scoped [:parsed-fn-form]
-  :before
-  (fn [form ctx]
-    [form
-     (when-> ctx (some->> :parents first (is-form? 'fn*))
-       (<- (let [[parsed ctx] (getsoc ctx :parsed-fn-form
-                                      #(conform! :shuriken.spec/fn-form
-                                                 (-> ctx :parents first)))]
-             (when-> ctx (and-> (<- (-> parsed :bodies count (> 1)))
-                                (<- (seq? form)))
-               (add-locals-to-current-context
-                 (concat (keep identity [(:name parsed)])
-                         (-> (conform! :shuriken.spec/args+body form)
-                             :args deconstruct)))))))]))
+  locals-tracking-dance--let*-loop*-letfn*-binding-sym)
 
 (defdance ^:private locals-tracking-dance--fn*
   locals-tracking-dance--fn*-single-body
-  locals-tracking-dance--fn*-multiple-bodies)
+  ; locals-tracking-dance--fn*-multiple-bodies
+  )
 
 
+;; TODO: handle catch blocks (the name of the exception)
+;; TODO: deftype & defrecord fields are somehow local variables
 (defdance locals-tracking-dance
+  ; {:before (fn [form ctx] (pprint ctx) [form ctx])}
   reluctant-macroexpanding-dance
-  parents-dance
+  ancestors-dance
   indexed-dance
-  right-context-dance
+  precontext-dance
+  {:precontext-merge-plan {:locals fusion-locals}}
+
   locals-tracking-dance--top-level
-  locals-tracking-dance--handle-locals-from-left
   locals-tracking-dance--let*-loop*-letfn*
-  locals-tracking-dance--fn*)
+  locals-tracking-dance--fn*
+  ; locals-tracking-dance--reify*
+  )
 
 (defdance free-symbols-tracking-dance
   "Accepts an optional :bound-sym? function in the context."

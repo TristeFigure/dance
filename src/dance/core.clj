@@ -1,18 +1,19 @@
 (ns dance.core
-  (:require [shuriken.associative :refer [deep-merge]]
-            [shuriken.debug :refer [debug-print]]
-            [shuriken.namespace :refer [import-namespace]]
+  (:use clojure.pprint)
+  (:require [shuriken.associative :refer [map-vals deep-merge]]
+            [shuriken.sequential :refer [update-nth insert-at]]
+            [shuriken.string :refer [adjust]]
+            [shuriken.namespace :refer [import-namespace with-ns]]
             [arity.core :refer [arities]]
             [threading.core :refer :all]
             [weaving.core :refer :all]
-            [dance.choreography :as choreo]))
+            [dance.floor]
+            [dance.choreography]))
 
-(import-namespace dance.floor :except [is-form?])
+;; TODO: deprecated in newer versions of shuriken: renamed to
+;;  import-namespace-vars
+(import-namespace dance.floor)
 (import-namespace dance.choreography)
-
-(def ^:private is-form? @#'dance.floor/is-form?)
-
-(def ^:private dance-identity (context| identity))
 
 (def ^:dynamic *default-dance*
   {})
@@ -85,129 +86,61 @@
      :before-all handle-backtrack
      :after-all  handle-backtrack}))
 
-(defmacro ^:private add-debugs [debugs let-statement]
-  (let [debugs (resolve (or (and (symbol? debugs) debugs)
-                            debugs))]
-    (->> (update (vec let-statement) 1
-                 (fn [bindings]
-                   (->> bindings
-                        (partition 2)
-                        (map (fn [[k v]]
-                               (if-let [d (debugs k)]
-                                 [['prev-ctx 'ctx]
-                                  [k v]
-                                  ['_ d]]
-                                 [[k v]])))
-                        (apply concat)
-                        (apply concat)
-                        vec)))
-         (apply list))))
-
-(defn- should-debug? [ctx condition]
-  (and condition
-       (if-let [d (:debug-depth ctx)]
-         (if (neg? d)
-           true
-           (<= (:depth ctx) (:debug-depth ctx)))
-         true)))
-
-(defn- filter-ctx [ctx debug-context-whitelist debug-context-blacklist]
-  (if (seq debug-context-whitelist)
-    (select-keys ctx debug-context-whitelist)
-    (into {} (remove #(contains? debug-context-blacklist (key %))
-                     ctx))))
-
-(def ^:private tab "  ")
-
-(def ^:private dance*-debugs
-  '{[should-walk ctx]
-    (when (should-debug? ctx debug)
-      (let [tabs (str (apply str (repeat depth tab))
-                      "- ")]
-        (cond
-          (backtrack? ctx) (debug-print   (str tabs "Backtracked on ") form)
-          should-walk      (debug-print   (str tabs "Walking        ") form)
-          :else            (debug-print   (str tabs "Not walking    ") form)))
-      (when (should-debug? ctx debug-context)
-        (debug-print                     (str tabs "Context        ")
-                     (filter-ctx ctx
-                                 debug-context-whitelist
-                                 debug-context-blacklist))))
-
-    [pre-result ctx]
-    (when (should-debug? ctx debug)
-      (cond
-        (backtrack? ctx) (debug-print     (str tabs "Backtracked on ") form)
-        should-pre       (when (should-debug? ctx (not= pre-result form))
-                           (debug-print   (str tabs "Pre            ") pre-result)))
-      (when (should-debug? ctx (and debug-context (not= ctx prev-ctx)))
-        (debug-print                      (str tabs "New context    ")
-                                          (filter-ctx ctx
-                                                      debug-context-whitelist
-                                                      debug-context-blacklist)))
-      (when (•- ctx (-> :debug-depth (and-> (some-> (>= 0))
-                                            (= (-• :depth))
-                                            (<- (coll? pre-result)))))
-        (println
-          (str tabs tab
-               "... (not showing " (count pre-result) " children nodes)"))))
-
-    [result ctx]
-    (when (should-debug? ctx debug)
-      (if should-post
-        (when (should-debug? ctx (not= result posted out))
-          (debug-print                (str tabs "Post           ") result))
-        (debug-print                  (str tabs "No post        ") result))
-      (if (should-debug? ctx (and debug-context (not= ctx prev-ctx)))
-        (debug-print                  (str tabs "New context    ")
-                                      (filter-ctx ctx
-                                                  debug-context-whitelist
-                                                  debug-context-blacklist))))})
-
-;; Variable names in this function's "let" matter for the debugging from above.
 (defn- dance*
-  [form {:keys [walk?
+  [form {:keys [before after
                 pre?    pre
+                walk?   walk
+                step    step-in step-out
                 post?   post
-                before  after
                 context return
-                debug   debug-context
-                step
-                debug-context-whitelist debug-context-blacklist]
+                debug   debug?
+                debug-context debug-context-whitelist debug-context-blacklist
+                debug-context-style]
          :as opts}]
-  ;; TODO: ensure debugs are not added at compile-time if unnecessary.
-  (add-debugs
-    dance*-debugs
+  ;; Variable names in this "let" matter for the with-debugs macro
+  ;; TODO: ensure debugs are not added at compile-time unless necessary.
+  (with-debugs
     (let [[form ctx]        (before form context)
-          depth             (get ctx :depth 0)
-          tabs              (apply str (repeat (inc depth) "  "))
           [should-pre ctx]  (pre? form ctx)
-          [should-walk ctx] (walk? form ctx)
-          [pre-result ctx]  (if should-pre
+          [form ctx]        (if should-pre
                               (pre form ctx)
                               [form ctx])
+          [should-walk ctx] (walk? form ctx)
           opts              (assoc opts :context ctx)
-          [out ctx]         (if should-walk
-                              (context-walk
-                                step
-                                (fn [form ctx]
-                                  (dance* form (assoc opts :context ctx)))
-                                dance-identity
-                                pre-result
-                                ctx)
-                              [pre-result ctx])
-          [should-post ctx]   (post? out ctx)
-          [posted ctx]        (if should-post
-                                (post out ctx)
-                                [out ctx])
-          [result ctx]        (after posted ctx)]
-      [result ctx])))
+          [form ctx]        (if should-walk
+                              (walk opts form ctx)
+                              [form ctx])
+          [should-post ctx] (post? form ctx)
+          [form ctx]        (if should-post
+                              (post form ctx)
+                              [form ctx])
+          [form ctx]        (after form ctx)]
+      [form ctx])))
+
+(def empty-dance
+  (adapt-dance-fns
+    {:init (ctx->| prepare-dance-args prepare-scoped prepare-debug)
+     :before-all  identity   :after-all  identity
+     :before      identity   :after      identity
+     :pre?        any?       :pre        identity
+     :walk?       any?       :walk       context-walk
+     :post?       any?       :post       identity
+     :context     nil        :return     :form
+     :step        step       :step-in    dance*     :step-out same
+     :scoped      #{:scoped}
+     :handle-scope standard-handle-scope
+     :dance-args   []
+     :debug-context-whitelist #{}
+     :debug-context-blacklist #{}
+     :debug-context-style     :changed}))
+
 
 (defn- identities [& args]
   (when-> args (-> count (= 1))
     first))
 
 ;; TODO: support deepmerge (the way contexts are merged)
+;; TODO: modify example to show how to use :init
 (defn dance
   "A finely tunable, composable, equivalent of clojure.walk with enhancements.
 
@@ -298,7 +231,7 @@
   ```
 
   `:debug`, `:return `, and `:step` are merged normally, i.e.
-  via right-most preference.
+  via right-most preference. TODO: not anymore.
 
   #### Early return
 
@@ -318,7 +251,7 @@
 
   #### Additional options
 
-  - `context`                : The initial context (defaults to `{}`)
+  - `context`                : The initial context (defaults to `{}`).
   - `return`                 : `:form`, `:form-and-context` or `:context` (:form).
   - `step`                   : low-level option. See [[step]] and
                                [[step-indexed]]. Defaults to [[step]]
@@ -328,6 +261,7 @@
   - `debug-depth`            : To limit the debug trace to a certain depth.
   - `debug-context-blacklist`: To mask certain context keys when debugging.
   - `debug-context-whitelist`: To display only certain context keys.
+  - `debug?`                 : a fn form,ctx-->bool to limit debugging output.
 
   Any option passed to `dance` is optional, including the dance fns."
   [form & args]
@@ -338,44 +272,18 @@
                         (map vec)
                         (into {}))
         dances (concat dances [args-dance])
-        opts-dance (apply merge-dances empty-dance *default-dance* dances)
-        debug-context (if (contains? opts-dance :debug-context)
-                        (:debug-context args-dance)
-                        (or (#{:context :form-and-context}
-                               (:return args-dance))
-                            (contains? args-dance :context)
-                            (contains? args-dance :debug-context-whitelist)
-                            (contains? args-dance :debug-context-blacklist)
-                            (->> (select-keys args-dance
-                                              [:walk? :pre? :pre :post? :post
-                                               :before :after
-                                               :before-all :after-all])
-                                 vals
-                                 (mapcat arities)
-                                 (some #(= % 2)))))
-        opts-dance (-> (assoc opts-dance
-                         :debug-context debug-context
-                         :debug (get opts-dance :debug
-                                     (:debug-context opts-dance)))
-                       (when->> :debug (merge-dances choreo/depth-dance)))
-        {:keys [before-all after-all]} opts-dance
-        [form ctx] (before-all form (:context opts-dance))
-        [danced ctx] (try (dance* form (-> opts-dance
-                                           (dissoc :before-all :after-all)
-                                           (assoc :context ctx)
-                                           (•- (assoc-in [:context :scoped]
-                                                         (-• :scoped)))
-                                           (let-> [d :debug-depth]
-                                             (when-> (<- d)
-                                               (assoc-in [:context :debug-depth]
-                                                         d)))))
+        dance (apply merge-dances empty-dance *default-dance* dances)
+        [dance ctx] ((:init dance) (dissoc dance :context) (:context dance))
+        {:keys [before-all after-all]} dance
+        [form ctx] (before-all form ctx)
+        [danced ctx] (try (dance* form (assoc dance :context ctx))
                        (catch clojure.lang.ExceptionInfo e
                          (let [d (ex-data e)]
                            (if (-> d :type (= ::break-dance))
                              ((juxt :form :ctx) d)
                              (throw e)))))
         [result ctx] (after-all danced ctx)
-        [mode returner] (let [r (-> opts-dance :return)]
+        [mode returner] (let [r (-> dance :return)]
                           (if (keyword? r) [r identities] r))]
     ;; TODO: document :return properly
     (case mode
